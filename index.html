@@ -125,7 +125,7 @@ const SPEED  = CELL * 0.10;
 // Cooperative planning: one time-step = one cell move.
 // FPC = how many real frames that one cell move takes.
 const FPC    = Math.max(6, Math.round(CELL / SPEED));
-const T_MAX  = 120;   // max time-steps in cooperative A*
+const T_MAX  = 200;   // max time-steps in cooperative A*
 
 const COLORS = ['#ff6b6b', '#4ecdc4', '#ffd93d', '#a29bfe'];
 const NAMES  = ['R1', 'R2', 'R3', 'R4'];
@@ -145,7 +145,7 @@ let hover     = null;
 let frame     = 0;
 let slowMode  = false;
 
-const getFPC = () => slowMode ? FPC * 4 : FPC;
+const getFPC = () => slowMode ? Math.round(FPC * 2.5) : Math.max(4, Math.floor(FPC * 0.6));
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helpers
@@ -239,14 +239,15 @@ function astar(sc, sr, gc, gr) {
 //  another robot has priority over a cell at a given time step.
 //  Swap collisions (A→B while B→A) are also prevented.
 // ─────────────────────────────────────────────────────────────────────────────
+const WAIT_COST = 3.0;  // waiting costs 3× a normal move — robots strongly prefer backing up to a free cell over freezing in place
 const DIRS9 = [   // 8 directions + wait-in-place
   [-1,-1,Math.SQRT2],[-1,0,1],[-1,1,Math.SQRT2],
-  [ 0,-1,1],[ 0,0,1],[ 0,1,1],            // [0,0,1] = wait
+  [ 0,-1,1],[ 0,0,WAIT_COST],[ 0,1,1],
   [ 1,-1,Math.SQRT2],[ 1,0,1],[ 1,1,Math.SQRT2]
 ];
 
 function timespaceAstar(sc, sr, gc, gr, reservations) {
-  const h    = (c,r) => hypot(gc-c, gr-r);
+  const h    = (c,r) => hypot(gc-c, gr-r) * 0.8;
   const skey = (c,r,t) => (c*N+r)*T_MAX + t;
 
   const heap=new MinHeap(), gMap=new Map(), closed=new Set();
@@ -312,40 +313,85 @@ function makeRobots() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Start — cooperative path planning then pure interpolation
+//  Permutation helper — generates all 24 orderings of [0,1,2,3]
+// ─────────────────────────────────────────────────────────────────────────────
+function permutations(arr) {
+  if (arr.length <= 1) return [[...arr]];
+  const out = [];
+  for (let i = 0; i < arr.length; i++) {
+    const rest = [...arr.slice(0,i), ...arr.slice(i+1)];
+    for (const p of permutations(rest)) out.push([arr[i], ...p]);
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Try every planning order; return paths that maximise robots arriving
+//  and minimise total path cost (so the robot with most free space yields)
+// ─────────────────────────────────────────────────────────────────────────────
+function planBestOrder() {
+  const hasStatic = robots.map(r => !!astar(r.sc, r.sr, r.gc, r.gr));
+  const PERMS = permutations([0,1,2,3]);
+
+  let bestPaths = new Array(4).fill(null);
+  let bestCount = -1;
+  let bestCost  = Infinity;
+
+  for (const order of PERMS) {
+    const reservations = new Map();
+    const paths = new Array(4).fill(null);
+    let count = 0, cost = 0;
+
+    for (const i of order) {
+      if (!hasStatic[i]) continue;
+      const r    = robots[i];
+      const path = timespaceAstar(r.sc, r.sr, r.gc, r.gr, reservations);
+      if (!path) continue;
+      paths[i] = path;
+      count++;
+      cost += path.length;
+      for (let t = 0; t < path.length; t++)
+        reservations.set(`${path[t][0]},${path[t][1]},${t}`, i);
+      const [fg,rg] = path[path.length-1];
+      for (let t = path.length; t < T_MAX; t++)
+        reservations.set(`${fg},${rg},${t}`, i);
+    }
+
+    if (count > bestCount || (count === bestCount && cost < bestCost)) {
+      bestCount = count;
+      bestCost  = cost;
+      bestPaths = [...paths];
+    }
+  }
+
+  return bestPaths;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Start — find best planning order, then pure interpolation
 // ─────────────────────────────────────────────────────────────────────────────
 function startSim() {
   if (mode === 'running') return;
 
-  const reservations = new Map();   // "c,r,t" → robotIndex
+  // Reset all robots to starting positions
+  for (let i = 0; i < robots.length; i++) {
+    const r = robots[i];
+    [r.x, r.y] = cellPx(r.sc, r.sr);
+    r.vx=0; r.vy=0; r.trail=[]; r.done=false; r.trapped=false;
+    r.timeStep=0; r.subStep=0; r.path=[];
+  }
+
+  const paths   = planBestOrder();
   const trapped = [];
 
   for (let i = 0; i < robots.length; i++) {
-    const r = robots[i];
-    // Reset to starting position
-    [r.x, r.y]  = cellPx(r.sc, r.sr);
-    r.vx=0; r.vy=0; r.trail=[]; r.done=false; r.trapped=false;
-    r.timeStep=0; r.subStep=0;
-
-    // First verify a static path exists (fast check, ignores other robots)
-    if (!astar(r.sc, r.sr, r.gc, r.gr)) {
-      r.trapped=true; r.done=true; trapped.push(r.name); continue;
+    if (paths[i]) {
+      robots[i].path = paths[i];
+    } else {
+      robots[i].trapped = true;
+      robots[i].done    = true;
+      trapped.push(robots[i].name);
     }
-
-    // Cooperative time-space plan (avoids all higher-priority robots)
-    const path = timespaceAstar(r.sc, r.sr, r.gc, r.gr, reservations);
-    if (!path) {
-      r.trapped=true; r.done=true; trapped.push(r.name); continue;
-    }
-    r.path = path;
-
-    // Reserve every cell along this robot's path
-    for (let t=0; t<path.length; t++) {
-      reservations.set(`${path[t][0]},${path[t][1]},${t}`, i);
-    }
-    // Reserve the goal cell for all remaining time steps (robot stays there)
-    const [fg,rg] = path[path.length-1];
-    for (let t=path.length; t<T_MAX; t++) reservations.set(`${fg},${rg},${t}`, i);
   }
 
   setMode('running');
