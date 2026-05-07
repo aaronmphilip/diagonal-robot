@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Diagonal Robot Navigation</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #eef0f5;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Courier New', monospace;
+      gap: 10px;
+      color: #555;
+      user-select: none;
+    }
+
+    h1 { font-size: 10px; letter-spacing: 4px; color: #8888aa; }
+
+    #mode-bar {
+      font-size: 10px;
+      letter-spacing: 2px;
+      color: #9999bb;
+      height: 14px;
+      transition: color 0.3s;
+    }
+    #mode-bar.running { color: #2aa89f; }
+    #mode-bar.done    { color: #7060d0; }
+    #mode-bar.error   { color: #cc3333; }
+
+    canvas {
+      border-radius: 6px;
+      cursor: crosshair;
+      display: block;
+      box-shadow: 0 2px 16px #00000018;
+    }
+
+    #controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    button {
+      padding: 6px 16px;
+      background: #fff;
+      border: 1px solid #ccd;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 9px;
+      letter-spacing: 2px;
+      color: #778;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+    button:hover    { color: #334; border-color: #99a; background: #f5f5fc; }
+    button.go       { border-color: #99bbee; color: #3366cc; background: #f0f5ff; }
+    button.go:hover { border-color: #3366cc; color: #1144aa; }
+    button:disabled { opacity: 0.35; cursor: default; }
+
+    #legend {
+      display: flex;
+      gap: 14px;
+      font-size: 9px;
+      letter-spacing: 1px;
+      color: #9999bb;
+    }
+    .leg { display: flex; align-items: center; gap: 5px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+    #hint {
+      font-size: 9px;
+      letter-spacing: 1px;
+      color: #aaaacc;
+      height: 12px;
+    }
+  </style>
+</head>
+<body>
+
+<h1>DIAGONAL ROBOT NAVIGATION + OBSTACLES</h1>
+<div id="mode-bar">SETUP — click any cell to place or remove an obstacle</div>
+<canvas id="c"></canvas>
+
+<div id="controls">
+  <button id="btn-go"    class="go" onclick="startSim()">[ START ]</button>
+  <button id="btn-slow"            onclick="toggleSlow()">[ SLOW MODE ]</button>
+  <button id="btn-clear"           onclick="clearObs()">[ CLEAR OBSTACLES ]</button>
+  <button id="btn-reset"           onclick="resetSim()">[ RESET ]</button>
+</div>
+
+<div id="legend">
+  <div class="leg"><div class="dot" style="background:#ff6b6b"></div>R1 TL → BR</div>
+  <div class="leg"><div class="dot" style="background:#4ecdc4"></div>R2 TR → BL</div>
+  <div class="leg"><div class="dot" style="background:#ffd93d"></div>R3 BR → TL</div>
+  <div class="leg"><div class="dot" style="background:#a29bfe"></div>R4 BL → TR</div>
+</div>
+<div id="hint">corners are locked — everything else is fair game</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+//  Canvas + grid constants
+// ─────────────────────────────────────────────────────────────────────────────
+const canvas  = document.getElementById('c');
+const ctx     = canvas.getContext('2d');
+const modeBar = document.getElementById('mode-bar');
+const btnGo   = document.getElementById('btn-go');
+const btnClear= document.getElementById('btn-clear');
+
+const SIZE  = Math.min(window.innerWidth - 32, window.innerHeight - 210, 580);
+canvas.width = canvas.height = SIZE;
+
+const N      = 18;
+const PAD    = Math.round(SIZE * 0.04);
+const AREA   = SIZE - 2 * PAD;
+const CELL   = AREA / N;
+const R      = Math.round(CELL * 0.28);
+const SPEED  = CELL * 0.10;
+
+// Cooperative planning: one time-step = one cell move.
+// FPC = how many real frames that one cell move takes.
+const FPC    = Math.max(6, Math.round(CELL / SPEED));
+const T_MAX  = 120;   // max time-steps in cooperative A*
+
+const COLORS = ['#ff6b6b', '#4ecdc4', '#ffd93d', '#a29bfe'];
+const NAMES  = ['R1', 'R2', 'R3', 'R4'];
+
+// Corners TL=0 TR=1 BR=2 BL=3; each robot → opposite corner
+const CORS = [[0,0],[N-1,0],[N-1,N-1],[0,N-1]];
+const DEST = [2, 3, 0, 1];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  State
+// ─────────────────────────────────────────────────────────────────────────────
+let obstacles = new Set();
+let robots    = [];
+let mode      = 'setup';
+let raf       = null;
+let hover     = null;
+let frame     = 0;
+let slowMode  = false;
+
+const getFPC = () => slowMode ? FPC * 4 : FPC;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+const okey     = (c, r)  => `${c},${r}`;
+const isObs    = (c, r)  => obstacles.has(okey(c, r));
+const isCorner = (c, r)  => CORS.some(([a,b]) => a===c && b===r);
+const hypot    = (x, y)  => Math.sqrt(x*x + y*y);
+const norm     = (x, y)  => { const l=hypot(x,y); return l>0?[x/l,y/l]:[0,0]; };
+const inGrid   = (c, r)  => c>=0 && c<N && r>=0 && r<N;
+const cellPx   = (c, r)  => [PAD + c*CELL + CELL*0.5, PAD + r*CELL + CELL*0.5];
+const pxCell   = (px,py) => [Math.floor((px-PAD)/CELL), Math.floor((py-PAD)/CELL)];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Min-heap (needed for fast A*)
+// ─────────────────────────────────────────────────────────────────────────────
+class MinHeap {
+  constructor() { this.h = []; }
+  push(n) {
+    this.h.push(n);
+    let i = this.h.length - 1;
+    while (i > 0) {
+      const p = (i-1)>>1;
+      if (this.h[p].f <= this.h[i].f) break;
+      [this.h[p],this.h[i]] = [this.h[i],this.h[p]]; i = p;
+    }
+  }
+  pop() {
+    const top = this.h[0], last = this.h.pop();
+    if (this.h.length) {
+      this.h[0] = last;
+      let i = 0;
+      for (;;) {
+        let s=i, l=2*i+1, r=2*i+2;
+        if (l<this.h.length && this.h[l].f<this.h[s].f) s=l;
+        if (r<this.h.length && this.h[r].f<this.h[s].f) s=r;
+        if (s===i) break;
+        [this.h[s],this.h[i]]=[this.h[i],this.h[s]]; i=s;
+      }
+    }
+    return top;
+  }
+  get size() { return this.h.length; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Standard A* — used only to check if a static path exists (trapped check)
+// ─────────────────────────────────────────────────────────────────────────────
+const DIRS8 = [
+  [-1,-1,Math.SQRT2],[-1,0,1],[-1,1,Math.SQRT2],
+  [ 0,-1,1],                  [ 0,1,1],
+  [ 1,-1,Math.SQRT2],[ 1,0,1],[ 1,1,Math.SQRT2]
+];
+
+function astar(sc, sr, gc, gr) {
+  const h   = (c,r) => hypot(gc-c, gr-r);
+  const key = (c,r) => c*N+r;
+  const heap = new MinHeap(), gMap = new Map(), closed = new Set();
+  heap.push({f:h(sc,sr), g:0, c:sc, r:sr, par:null});
+  gMap.set(key(sc,sr), 0);
+  while (heap.size) {
+    const cur = heap.pop();
+    const ck  = key(cur.c, cur.r);
+    if (closed.has(ck)) continue;
+    closed.add(ck);
+    if (cur.c===gc && cur.r===gr) {
+      const p=[]; let n=cur; while(n){p.unshift([n.c,n.r]);n=n.par;} return p;
+    }
+    for (const [dc,dr,cost] of DIRS8) {
+      const nc=cur.c+dc, nr=cur.r+dr;
+      if (!inGrid(nc,nr) || isObs(nc,nr)) continue;
+      if (dc&&dr&&(isObs(cur.c+dc,cur.r)||isObs(cur.c,cur.r+dr))) continue;
+      const nk=key(nc,nr);
+      if (closed.has(nk)) continue;
+      const g=cur.g+cost;
+      if (g<(gMap.get(nk)??Infinity)) {
+        gMap.set(nk,g);
+        heap.push({f:g+h(nc,nr),g,c:nc,r:nr,par:cur});
+      }
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Cooperative Time-Space A*
+//
+//  Plans a path for one robot in (col, row, time-step) space.
+//  "reservations" is a Map of "c,r,t" → robotIndex for already-planned robots.
+//  A robot can also wait in place ([0,0] move) — this lets it yield when
+//  another robot has priority over a cell at a given time step.
+//  Swap collisions (A→B while B→A) are also prevented.
+// ─────────────────────────────────────────────────────────────────────────────
+const DIRS9 = [   // 8 directions + wait-in-place
+  [-1,-1,Math.SQRT2],[-1,0,1],[-1,1,Math.SQRT2],
+  [ 0,-1,1],[ 0,0,1],[ 0,1,1],            // [0,0,1] = wait
+  [ 1,-1,Math.SQRT2],[ 1,0,1],[ 1,1,Math.SQRT2]
+];
+
+function timespaceAstar(sc, sr, gc, gr, reservations) {
+  const h    = (c,r) => hypot(gc-c, gr-r);
+  const skey = (c,r,t) => (c*N+r)*T_MAX + t;
+
+  const heap=new MinHeap(), gMap=new Map(), closed=new Set();
+  heap.push({f:h(sc,sr), g:0, c:sc, r:sr, t:0, par:null});
+  gMap.set(skey(sc,sr,0), 0);
+
+  while (heap.size) {
+    const cur = heap.pop();
+    const ck  = skey(cur.c, cur.r, cur.t);
+    if (closed.has(ck)) continue;
+    closed.add(ck);
+
+    if (cur.c===gc && cur.r===gr) {
+      const p=[]; let n=cur; while(n){p.unshift([n.c,n.r]);n=n.par;} return p;
+    }
+    if (cur.t >= T_MAX-1) continue;
+    const nt = cur.t+1;
+
+    for (const [dc,dr,cost] of DIRS9) {
+      const nc=cur.c+dc, nr=cur.r+dr;
+      if (!inGrid(nc,nr) || isObs(nc,nr)) continue;
+      if (dc&&dr&&(isObs(cur.c+dc,cur.r)||isObs(cur.c,cur.r+dr))) continue;
+
+      // Cell occupied by a higher-priority robot at the next time step?
+      if (reservations.has(`${nc},${nr},${nt}`)) continue;
+
+      // Swap collision: would we cross paths with a robot moving the other way?
+      const whoAtNcNow  = reservations.get(`${nc},${nr},${cur.t}`);
+      const whoAtCurNxt = reservations.get(`${cur.c},${cur.r},${nt}`);
+      if (whoAtNcNow !== undefined && whoAtNcNow === whoAtCurNxt) continue;
+
+      const nk = skey(nc,nr,nt);
+      if (closed.has(nk)) continue;
+      const g = cur.g+cost;
+      if (g<(gMap.get(nk)??Infinity)) {
+        gMap.set(nk,g);
+        heap.push({f:g+h(nc,nr),g,c:nc,r:nr,t:nt,par:cur});
+      }
+    }
+  }
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Robot factory
+// ─────────────────────────────────────────────────────────────────────────────
+function makeRobots() {
+  return CORS.map(([sc,sr], i) => {
+    const [gc,gr] = CORS[DEST[i]];
+    const [x,y]   = cellPx(sc,sr);
+    return {
+      sc,sr, gc,gr,
+      x,y, vx:0, vy:0,
+      color:COLORS[i], name:NAMES[i],
+      path:[],          // time-space path: [[c,r], [c,r], ...]
+      timeStep:0,       // which path index the robot is "between"
+      subStep:0,        // frame within the current cell-to-cell move (0..FPC-1)
+      trail:[],
+      done:false,
+      trapped:false,
+    };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Start — cooperative path planning then pure interpolation
+// ─────────────────────────────────────────────────────────────────────────────
+function startSim() {
+  if (mode === 'running') return;
+
+  const reservations = new Map();   // "c,r,t" → robotIndex
+  const trapped = [];
+
+  for (let i = 0; i < robots.length; i++) {
+    const r = robots[i];
+    // Reset to starting position
+    [r.x, r.y]  = cellPx(r.sc, r.sr);
+    r.vx=0; r.vy=0; r.trail=[]; r.done=false; r.trapped=false;
+    r.timeStep=0; r.subStep=0;
+
+    // First verify a static path exists (fast check, ignores other robots)
+    if (!astar(r.sc, r.sr, r.gc, r.gr)) {
+      r.trapped=true; r.done=true; trapped.push(r.name); continue;
+    }
+
+    // Cooperative time-space plan (avoids all higher-priority robots)
+    const path = timespaceAstar(r.sc, r.sr, r.gc, r.gr, reservations);
+    if (!path) {
+      r.trapped=true; r.done=true; trapped.push(r.name); continue;
+    }
+    r.path = path;
+
+    // Reserve every cell along this robot's path
+    for (let t=0; t<path.length; t++) {
+      reservations.set(`${path[t][0]},${path[t][1]},${t}`, i);
+    }
+    // Reserve the goal cell for all remaining time steps (robot stays there)
+    const [fg,rg] = path[path.length-1];
+    for (let t=path.length; t<T_MAX; t++) reservations.set(`${fg},${rg},${t}`, i);
+  }
+
+  setMode('running');
+  if (trapped.length) {
+    modeBar.textContent = `⚠ ${trapped.join(' & ')} walled in — clear the cells next to their corner`;
+    modeBar.className = 'error';
+  }
+  if (raf) cancelAnimationFrame(raf);
+  raf = requestAnimationFrame(loop);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Step — pure smooth interpolation, zero forces
+//  Robots simply interpolate between consecutive cells in their time-space path.
+//  When path[t] === path[t+1] the robot waits in place (yielding to others).
+// ─────────────────────────────────────────────────────────────────────────────
+function step() {
+  for (const r of robots) {
+    if (r.done || r.trapped) continue;
+
+    // Advance frame counter
+    const fpc = getFPC();
+    r.subStep++;
+    if (r.subStep >= fpc) {
+      r.subStep = 0;
+      r.timeStep++;
+    }
+
+    // Arrived at final cell?
+    if (r.timeStep >= r.path.length - 1) {
+      [r.x, r.y] = cellPx(r.gc, r.gr);
+      r.vx = 0; r.vy = 0;
+      r.done = true;
+      continue;
+    }
+
+    // Interpolate pixel position between path[timeStep] and path[timeStep+1]
+    const [c0,r0] = r.path[r.timeStep];
+    const [c1,r1] = r.path[r.timeStep+1];
+    const [x0,y0] = cellPx(c0,r0);
+    const [x1,y1] = cellPx(c1,r1);
+    const t = r.subStep / fpc;
+
+    r.x  = x0 + (x1-x0)*t;
+    r.y  = y0 + (y1-y0)*t;
+    r.vx = (x1-x0)/fpc;   // used only for direction arrow in draw()
+    r.vy = (y1-y0)/fpc;
+
+    r.trail.push([r.x, r.y]);
+    if (r.trail.length > 220) r.trail.shift();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Draw
+// ─────────────────────────────────────────────────────────────────────────────
+function draw() {
+  ctx.clearRect(0,0,SIZE,SIZE);
+
+  // Background
+  ctx.fillStyle = '#eef0f5';
+  ctx.fillRect(0,0,SIZE,SIZE);
+
+  // Cells
+  for (let c=0; c<N; c++) {
+    for (let r=0; r<N; r++) {
+      const x=PAD+c*CELL, y=PAD+r*CELL, w=CELL-1, h=CELL-1;
+      if (isObs(c,r)) {
+        ctx.fillStyle = '#f5d0d0';
+        ctx.fillRect(x+.5,y+.5,w,h);
+        ctx.strokeStyle='#e09090'; ctx.lineWidth=.8;
+        ctx.beginPath();
+        ctx.moveTo(x+2,y+2); ctx.lineTo(x+w-1,y+h-1);
+        ctx.moveTo(x+w-1,y+2); ctx.lineTo(x+2,y+h-1);
+        ctx.stroke();
+      } else if (isCorner(c,r)) {
+        const idx=CORS.findIndex(([a,b])=>a===c&&b===r);
+        ctx.fillStyle=COLORS[idx]+'28';
+        ctx.fillRect(x+.5,y+.5,w,h);
+        ctx.strokeStyle=COLORS[idx]+'aa'; ctx.lineWidth=1.2;
+        ctx.strokeRect(x+1.5,y+1.5,w-2,h-2);
+      } else {
+        ctx.fillStyle='#ffffff';
+        ctx.fillRect(x+.5,y+.5,w,h);
+      }
+    }
+  }
+
+  // Grid lines
+  ctx.strokeStyle='#d0d4e8'; ctx.lineWidth=.5;
+  for (let i=0;i<=N;i++) {
+    const v=PAD+i*CELL;
+    ctx.beginPath(); ctx.moveTo(v,PAD); ctx.lineTo(v,PAD+AREA); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(PAD,v); ctx.lineTo(PAD+AREA,v); ctx.stroke();
+  }
+
+  // Border
+  ctx.strokeStyle='#b0b4cc'; ctx.lineWidth=1.5;
+  ctx.strokeRect(PAD,PAD,AREA,AREA);
+
+  // Hover highlight (setup mode)
+  if (mode==='setup' && hover) {
+    const [hc,hr]=hover;
+    if (!isCorner(hc,hr)) {
+      ctx.fillStyle=isObs(hc,hr)?'#ff000012':'#00000009';
+      ctx.fillRect(PAD+hc*CELL+.5,PAD+hr*CELL+.5,CELL-1,CELL-1);
+    }
+  }
+
+  // Planned path dots (remaining waypoints)
+  if (mode==='running'||mode==='done') {
+    for (const r of robots) {
+      if (r.done||r.trapped||r.path.length<2) continue;
+      ctx.fillStyle=r.color+'55';
+      for (let i=r.timeStep+1;i<r.path.length;i++) {
+        const [cx,cy]=cellPx(r.path[i][0],r.path[i][1]);
+        ctx.beginPath(); ctx.arc(cx,cy,2,0,Math.PI*2); ctx.fill();
+      }
+    }
+  }
+
+  // Destination rings
+  for (const r of robots) {
+    const [gx,gy]=cellPx(r.gc,r.gr);
+    ctx.beginPath(); ctx.arc(gx,gy,R*1.5,0,Math.PI*2);
+    ctx.strokeStyle=r.color+(r.done?'dd':'70');
+    ctx.lineWidth=1.5;
+    ctx.setLineDash(r.done?[]:[3,3]);
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // Trails
+  for (const r of robots) {
+    const t=r.trail;
+    if (t.length<2) continue;
+    for (let i=1;i<t.length;i++) {
+      const a=Math.floor((i/t.length)*90).toString(16).padStart(2,'0');
+      ctx.beginPath();
+      ctx.moveTo(t[i-1][0],t[i-1][1]);
+      ctx.lineTo(t[i][0],t[i][1]);
+      ctx.strokeStyle=r.color+a; ctx.lineWidth=1.8; ctx.stroke();
+    }
+  }
+
+  // Trapped: flash blocked neighbours
+  for (const r of robots) {
+    if (!r.trapped) continue;
+    for (let dc=-1;dc<=1;dc++) for (let dr=-1;dr<=1;dr++) {
+      if (!dc&&!dr) continue;
+      const nc=r.sc+dc, nr=r.sr+dr;
+      if (!inGrid(nc,nr)||!isObs(nc,nr)) continue;
+      const bx=PAD+nc*CELL, by=PAD+nr*CELL;
+      ctx.fillStyle=`rgba(220,50,50,${.15+.1*Math.sin(frame*.08)})`;
+      ctx.fillRect(bx+.5,by+.5,CELL-1,CELL-1);
+    }
+  }
+
+  // Robots
+  for (const r of robots) {
+    const {x,y,done,trapped}=r;
+
+    // Trapped pulsing ring
+    if (trapped) {
+      const p=.5+.5*Math.sin(frame*.10);
+      ctx.beginPath(); ctx.arc(x,y,R*(1.8+.4*p),0,Math.PI*2);
+      ctx.strokeStyle=`rgba(200,40,40,${.5*p})`; ctx.lineWidth=2; ctx.stroke();
+    }
+
+    // Shadow
+    const g=ctx.createRadialGradient(x,y+2,0,x,y+2,R*2.8);
+    g.addColorStop(0,`rgba(0,0,0,${done?.06:.12})`);
+    g.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.arc(x,y+2,R*2.8,0,Math.PI*2);
+    ctx.fillStyle=g; ctx.fill();
+
+    // Body
+    ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2);
+    ctx.fillStyle=trapped?'#ccc':(done?r.color+'aa':r.color);
+    ctx.fill();
+
+    // Rim
+    ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2);
+    ctx.strokeStyle=trapped?'rgba(200,80,80,.8)':'rgba(255,255,255,.7)';
+    ctx.lineWidth=trapped?2:1.5; ctx.stroke();
+
+    // Direction arrow
+    if (!done&&!trapped&&(r.vx||r.vy)) {
+      const [nx,ny]=norm(r.vx,r.vy);
+      ctx.beginPath();
+      ctx.moveTo(x+nx*R*.52,y+ny*R*.52);
+      ctx.lineTo(x-nx*R*.42,y-ny*R*.42);
+      ctx.strokeStyle='rgba(255,255,255,.8)'; ctx.lineWidth=1.8; ctx.stroke();
+    }
+
+    // X on trapped
+    if (trapped) {
+      ctx.strokeStyle='rgba(180,30,30,.75)'; ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(x-R*.5,y-R*.5); ctx.lineTo(x+R*.5,y+R*.5);
+      ctx.moveTo(x+R*.5,y-R*.5); ctx.lineTo(x-R*.5,y+R*.5);
+      ctx.stroke();
+    }
+
+    // Label
+    const fs=Math.max(7,Math.floor(R*.76));
+    ctx.font=`bold ${fs}px Courier New`;
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle=trapped?'rgba(150,30,30,.8)':(done?'rgba(0,0,0,.35)':'rgba(0,0,0,.75)');
+    ctx.fillText(r.name,x,y);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Loop
+// ─────────────────────────────────────────────────────────────────────────────
+function loop() {
+  frame++;
+  step();
+  draw();
+
+  const active   = robots.filter(r=>!r.trapped);
+  const arrived  = active.filter(r=>r.done).length;
+  const nTrapped = robots.filter(r=>r.trapped).length;
+
+  if (arrived < active.length) {
+    if (!nTrapped) modeBar.textContent=`RUNNING — ${arrived} / ${active.length} arrived`;
+    raf = requestAnimationFrame(loop);
+  } else {
+    const msg = nTrapped
+      ? `${active.length} arrived — ${nTrapped} robot${nTrapped>1?'s':''} walled in. Hit RESET.`
+      : 'ALL ROBOTS ARRIVED — hit RESET to run again';
+    setMode('done', msg);
+    if (nTrapped) modeBar.className='error';
+    draw();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Mode + controls
+// ─────────────────────────────────────────────────────────────────────────────
+function setMode(m, msg) {
+  mode = m;
+  modeBar.className = m;
+  const texts = {
+    setup:   'SETUP — click any cell to place or remove an obstacle',
+    running: 'RUNNING...',
+    done:    msg||'DONE',
+    error:   msg||'ERROR',
+  };
+  modeBar.textContent = msg||texts[m];
+  btnGo.disabled    = (m==='running');
+  btnClear.disabled = (m==='running');
+}
+
+function toggleSlow() {
+  slowMode = !slowMode;
+  const btn = document.getElementById('btn-slow');
+  btn.textContent = slowMode ? '[ NORMAL SPEED ]' : '[ SLOW MODE ]';
+  btn.style.borderColor = slowMode ? '#aa66cc' : '';
+  btn.style.color       = slowMode ? '#7733bb' : '';
+  btn.style.background  = slowMode ? '#f5f0ff' : '';
+}
+
+function clearObs() { obstacles.clear(); if (mode!=='running') draw(); }
+
+function resetSim() {
+  if (raf) { cancelAnimationFrame(raf); raf=null; }
+  robots = makeRobots();
+  frame  = 0;
+  setMode('setup');
+  draw();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Canvas interaction
+// ─────────────────────────────────────────────────────────────────────────────
+function getCell(e) {
+  const rect=canvas.getBoundingClientRect();
+  const [c,r]=pxCell(e.clientX-rect.left, e.clientY-rect.top);
+  return inGrid(c,r)?[c,r]:null;
+}
+
+canvas.addEventListener('mousemove', e=>{
+  if (mode!=='setup'){hover=null;return;}
+  hover=getCell(e); draw();
+});
+canvas.addEventListener('mouseleave',()=>{ hover=null; if(mode==='setup')draw(); });
+canvas.addEventListener('click', e=>{
+  if (mode!=='setup') return;
+  const cell=getCell(e); if (!cell) return;
+  const [c,r]=cell; if (isCorner(c,r)) return;
+  const k=okey(c,r);
+  if (obstacles.has(k)) obstacles.delete(k); else obstacles.add(k);
+  draw();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Boot
+// ─────────────────────────────────────────────────────────────────────────────
+robots = makeRobots();
+draw();
+</script>
+</body>
+</html>
